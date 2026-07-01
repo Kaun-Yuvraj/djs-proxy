@@ -98,7 +98,7 @@ server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const targetUrl = `wss://gateway.discord.gg${url.pathname}${url.search}`;
 
-  console.log(`[WS] Connecting to Discord Gateway: ${targetUrl}`);
+  console.log(`[WS] Incoming upgrade. Connecting to Discord: ${targetUrl}`);
 
   const targetHeaders = {};
   for (const [key, value] of Object.entries(request.headers)) {
@@ -111,35 +111,69 @@ server.on('upgrade', (request, socket, head) => {
     headers: targetHeaders
   });
 
-  wss.handleUpgrade(request, socket, head, (clientWs) => {
-    clientWs.on('message', (message) => {
+  const targetQueue = [];
+  const clientQueue = [];
+  let clientWs = null;
+  let targetOpen = false;
+
+  // Listeners on Target (Discord) WebSocket
+  targetWs.on('open', () => {
+    console.log('[WS] Connected to Discord Gateway successfully');
+    targetOpen = true;
+    // Flush client queue
+    while (clientQueue.length > 0) {
+      const { message, isBinary } = clientQueue.shift();
       if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(message);
+        targetWs.send(message, { binary: isBinary });
+      }
+    }
+  });
+
+  targetWs.on('message', (message, isBinary) => {
+    if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(message, { binary: isBinary });
+    } else {
+      targetQueue.push({ message, isBinary });
+    }
+  });
+
+  targetWs.on('close', (code, reason) => {
+    console.log(`[WS] Discord Gateway closed: ${code} - ${reason.toString()}`);
+    if (clientWs) clientWs.close(code, reason);
+  });
+
+  targetWs.on('error', (err) => {
+    console.error('[WS] Discord Gateway error:', err.message);
+    if (clientWs) clientWs.close(1011, err.message);
+  });
+
+  // Upgrade the incoming connection to Client WebSocket
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    clientWs = ws;
+    console.log('[WS] Client connection upgraded successfully');
+
+    // Flush target queue (delivers early packets like Hello from Discord)
+    while (targetQueue.length > 0) {
+      const { message, isBinary } = targetQueue.shift();
+      clientWs.send(message, { binary: isBinary });
+    }
+
+    clientWs.on('message', (message, isBinary) => {
+      if (targetOpen && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(message, { binary: isBinary });
+      } else {
+        clientQueue.push({ message, isBinary });
       }
     });
 
     clientWs.on('close', (code, reason) => {
+      console.log(`[WS] Client closed connection: ${code} - ${reason.toString()}`);
       targetWs.close(code, reason);
     });
 
     clientWs.on('error', (err) => {
-      console.error('[WS Client Error]', err.message);
-      targetWs.close();
-    });
-
-    targetWs.on('message', (message) => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(message);
-      }
-    });
-
-    targetWs.on('close', (code, reason) => {
-      clientWs.close(code, reason);
-    });
-
-    targetWs.on('error', (err) => {
-      console.error('[WS Gateway Error]', err.message);
-      clientWs.close();
+      console.error('[WS] Client connection error:', err.message);
+      targetWs.close(1011, err.message);
     });
   });
 });
