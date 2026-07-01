@@ -139,7 +139,13 @@ server.on('upgrade', (request, socket, head) => {
 
   targetWs.on('close', (code, reason) => {
     console.log(`[WS] Discord Gateway closed: ${code} - ${reason.toString()}`);
-    if (clientWs) clientWs.close(code, reason);
+    if (clientWs) {
+      if (code && code !== 1006) {
+        clientWs.close(code, reason);
+      } else {
+        clientWs.close();
+      }
+    }
   });
 
   targetWs.on('error', (err) => {
@@ -168,7 +174,11 @@ server.on('upgrade', (request, socket, head) => {
 
     clientWs.on('close', (code, reason) => {
       console.log(`[WS] Client closed connection: ${code} - ${reason.toString()}`);
-      targetWs.close(code, reason);
+      if (code && code !== 1006) {
+        targetWs.close(code, reason);
+      } else {
+        targetWs.close();
+      }
     });
 
     clientWs.on('error', (err) => {
