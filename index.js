@@ -46,7 +46,7 @@ const server = http.createServer(async (req, res) => {
       const host = req.headers.host;
       
       // Force discord.js to use this proxy for the WS connection
-      data.url = `ws://${host}`;
+      data.url = `wss://${host}`;
       
       const responseBody = JSON.stringify(data);
       res.writeHead(200, {
