@@ -1,69 +1,94 @@
 const http = require('http');
-const https = require('https');
-const { URL } = require('url');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   // 1. REST Proxy
   let path = req.url;
   if (path.startsWith('/api')) {
     path = path.slice(4);
   }
 
-  const targetUrl = `https://discord.com/api${path}`;
-  const parsedUrl = new URL(targetUrl);
-
-  const headers = { ...req.headers };
-  delete headers.host;
-  delete headers['cf-connecting-ip'];
-  delete headers['x-real-ip'];
-
-  console.log(`[REST] ${req.method} ${targetUrl}`);
-
-  const proxyReq = https.request({
-    hostname: parsedUrl.hostname,
-    port: 443,
-    path: parsedUrl.pathname + parsedUrl.search,
-    method: req.method,
-    headers: headers
-  }, (proxyRes) => {
-    // If it's /gateway/bot, rewrite the WebSocket URL to force client through this proxy
-    if (path.endsWith('/gateway/bot') && proxyRes.statusCode === 200) {
-      let body = '';
-      proxyRes.on('data', (chunk) => { body += chunk; });
-      proxyRes.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          const host = req.headers.host;
-          
-          // Force discord.js to use this proxy server for WebSocket connection
-          data.url = `ws://${host}`;
-          
-          const responseBody = JSON.stringify(data);
-          const resHeaders = { ...proxyRes.headers };
-          resHeaders['content-length'] = Buffer.byteLength(responseBody);
-          res.writeHead(proxyRes.statusCode, resHeaders);
-          res.end(responseBody);
-        } catch (e) {
-          res.writeHead(proxyRes.statusCode, proxyRes.headers);
-          res.end(body);
-        }
-      });
-    } else {
-      res.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.pipe(res);
+  const discordApiUrl = `https://discord.com/api${path}`;
+  
+  // Clone and clean request headers
+  const headers = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (key !== 'host' && key !== 'connection' && key !== 'keep-alive') {
+      headers[key] = value;
     }
-  });
+  }
 
-  proxyReq.on('error', (err) => {
+  console.log(`[REST] ${req.method} ${discordApiUrl}`);
+
+  try {
+    const fetchOptions = {
+      method: req.method,
+      headers: headers,
+    };
+
+    // Forward request body if applicable
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const buffers = [];
+      for await (const chunk of req) {
+        buffers.push(chunk);
+      }
+      fetchOptions.body = Buffer.concat(buffers);
+      fetchOptions.duplex = 'half';
+    }
+
+    const response = await fetch(discordApiUrl, fetchOptions);
+
+    // If it's /gateway/bot, rewrite the WebSocket URL
+    if (path.endsWith('/gateway/bot') && response.status === 200) {
+      const data = await response.json();
+      const host = req.headers.host;
+      
+      // Force discord.js to use this proxy for the WS connection
+      data.url = `ws://${host}`;
+      
+      const responseBody = JSON.stringify(data);
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(responseBody)
+      });
+      return res.end(responseBody);
+    }
+
+    // Forward the response headers and status (cleaning up compression/length headers)
+    const resHeaders = {};
+    response.headers.forEach((value, key) => {
+      const lowerKey = key.toLowerCase();
+      // Since fetch decompresses the response automatically, we must NOT send
+      // content-encoding/content-length/transfer-encoding headers to the client.
+      if (
+        lowerKey !== 'content-encoding' &&
+        lowerKey !== 'transfer-encoding' &&
+        lowerKey !== 'content-length'
+      ) {
+        resHeaders[key] = value;
+      }
+    });
+
+    res.writeHead(response.status, resHeaders);
+    
+    // Pipe the response body stream to the client
+    if (response.body) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+    }
+    res.end();
+
+  } catch (err) {
     console.error(`[REST Error] ${err.message}`);
     res.writeHead(502);
     res.end(`Proxy REST Error: ${err.message}`);
-  });
-
-  req.pipe(proxyReq);
+  }
 });
 
 // 2. WebSocket Gateway Proxy
@@ -75,15 +100,18 @@ server.on('upgrade', (request, socket, head) => {
 
   console.log(`[WS] Connecting to Discord Gateway: ${targetUrl}`);
 
-  const targetHeaders = { ...request.headers };
-  delete targetHeaders.host;
+  const targetHeaders = {};
+  for (const [key, value] of Object.entries(request.headers)) {
+    if (key !== 'host' && key !== 'connection' && key !== 'upgrade') {
+      targetHeaders[key] = value;
+    }
+  }
 
   const targetWs = new WebSocket(targetUrl, {
     headers: targetHeaders
   });
 
   wss.handleUpgrade(request, socket, head, (clientWs) => {
-    // Pipe client <-> target WebSocket traffic
     clientWs.on('message', (message) => {
       if (targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(message);
